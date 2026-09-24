@@ -591,6 +591,7 @@ run_custom_external_modules() {
     local manifest="$CUSTOM_EXTERNAL_MODULES_MANIFEST"
     local executed=0 entry_stage module_dir repo_or_path entry_kind group_repo_url child_id setup_path
     local actual_sublevel
+    local module_env_file="$STATE_DATA_DIR/external_module_env"
 
     bool_is_true "$USE_CUSTOM_EXTERNAL_MODULES" || return 0
     [[ -s "$manifest" ]] || {
@@ -599,6 +600,7 @@ run_custom_external_modules() {
     }
 
     actual_sublevel="$(read_actual_sublevel)"
+    : >"$module_env_file"
 
     while IFS=$'\t' read -r entry_stage module_dir repo_or_path entry_kind group_repo_url child_id; do
         [[ "$entry_stage" == "$stage" ]] || continue
@@ -640,6 +642,7 @@ run_custom_external_modules() {
             export ABK_MODULE_ENTRY_KIND="${entry_kind:-module}"
             export ABK_MODULE_GROUP_REPO_URL="${group_repo_url:-}"
             export ABK_MODULE_CHILD_ID="${child_id:-}"
+            export GITHUB_ENV="$module_env_file"
             export ROOT_DIR STATE_DIR SOURCES_DIR WORKSPACE_DIR ARTIFACTS_DIR LOGS_DIR CACHE_DIR KEYS_DIR STATE_DATA_DIR
             export TEMPLATE_ROOT KERNEL_ROOT DEFCONFIG ABK_SOURCE ANYKERNEL3_SOURCE KERNEL_PATCHES_SOURCE SUKISU_PATCHES_SOURCE ACTION_BUILD_SOURCE SUSFS_SOURCE GCC_SOURCE VIRTUALIZATION_SOURCE VIRTUALIZATION_SUPPORT_PATCHES
             cd "$module_dir"
@@ -647,6 +650,19 @@ run_custom_external_modules() {
         )
         executed=$((executed + 1))
     done <"$manifest"
+
+    # Custom modules may export variables (e.g. ABK_EXTERNAL_MODULE_KO_LIST)
+    # through $GITHUB_ENV; pull them into this shell so the packaging step can
+    # use them. Parsed line-by-line because values legitimately contain spaces.
+    if [[ -s "$module_env_file" ]]; then
+        local env_line env_key
+        while IFS= read -r env_line; do
+            [[ "$env_line" == *=* ]] || continue
+            env_key="${env_line%%=*}"
+            [[ "$env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            export "$env_key=${env_line#*=}"
+        done <"$module_env_file"
+    fi
 
     if (( executed == 0 )); then
         log_info "no custom modules configured for stage $stage"
@@ -1664,6 +1680,97 @@ package_boot_images() {
     )
 }
 
+package_kernel_modules() {
+    local wanted="${ABK_EXTERNAL_MODULE_KO_LIST:-}"
+    local stage_dir="$WORKSPACE_DIR/staging/kernel-modules"
+    local prefix="${ANDROID_VERSION}-${KERNEL_VERSION}.${SUB_LEVEL}-${OS_PATCH_LEVEL}"
+    local zip_name="${prefix}-Kernel-Modules.zip"
+    local collected=0 ko hit
+    local -a roots
+
+    [[ -n "$wanted" ]] || return 0
+
+    rm -rf "$stage_dir"
+    mkdir -p "$stage_dir/system/lib/modules"
+
+    roots=()
+    for d in \
+        "$KERNEL_ROOT/out" \
+        "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64" \
+        "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64_modules" \
+        "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64_dist" \
+        "$KERNEL_ROOT/bazel-bin/common"; do
+        [[ -d "$d" ]] && roots+=("$d")
+    done
+
+    for ko in $wanted; do
+        hit=""
+        if (( ${#roots[@]} > 0 )); then
+            hit="$(find "${roots[@]}" -type f -name "$ko" 2>/dev/null | head -n1 || true)"
+        fi
+        if [[ -z "$hit" ]]; then
+            log_warn "kernel module not found: $ko"
+            continue
+        fi
+        cp -f "$hit" "$stage_dir/system/lib/modules/$ko"
+        collected=$((collected + 1))
+    done
+
+    if (( collected == 0 )); then
+        log_warn "no kernel module collected; skipping module package"
+        return 0
+    fi
+
+    cat >"$stage_dir/module.prop" <<EOF
+id=abk_kernel_modules
+name=ABK Kernel Modules
+version=$prefix
+versionCode=1
+author=ABK
+description=External kernel modules (USB serial / ST-Link) built for $prefix.
+EOF
+
+    cat >"$stage_dir/post-fs-data.sh" <<'KOMOD'
+#!/system/bin/sh
+MODDIR=${0%/*}
+# Load dependencies first, then the remaining modules.
+for ko in "$MODDIR"/system/lib/modules/usb_wwan.ko; do
+  [ -e "$ko" ] || continue
+  insmod "$ko" 2>/dev/null
+done
+for ko in "$MODDIR"/system/lib/modules/*.ko; do
+  [ -e "$ko" ] || continue
+  case "$ko" in
+    */usb_wwan.ko) continue ;;
+  esac
+  insmod "$ko" 2>/dev/null
+done
+KOMOD
+    chmod 0755 "$stage_dir/post-fs-data.sh"
+
+    mkdir -p "$stage_dir/META-INF/com/google/android"
+    cat >"$stage_dir/META-INF/com/google/android/update-binary" <<'KOUPD'
+#!/sbin/sh
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+  . /data/adb/magisk/util_functions.sh
+  install_module
+else
+  echo "KernelSU/Magisk module installer not found; install manually."
+fi
+exit 0
+KOUPD
+    printf '#MAGISK\n' >"$stage_dir/META-INF/com/google/android/updater-script"
+
+    (
+        cd "$stage_dir"
+        zip -qr "$ARTIFACTS_DIR/$zip_name" ./*
+    )
+    log_info "kernel module package: $ARTIFACTS_DIR/$zip_name"
+}
+
 print_loaded_env() {
     cat <<EOF
 ROOT_DIR=$ROOT_DIR
@@ -1738,6 +1845,7 @@ main() {
     if (( NO_PACKAGE == 0 )); then
         package_anykernel
         package_boot_images
+        package_kernel_modules
     fi
 
     log_info "build completed"

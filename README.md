@@ -178,6 +178,8 @@ https://github.com/user/module-a;after_patch|https://github.com/user/module-b;be
 | `AVBTOOL` / `MKBOOTIMG` / `UNPACK_BOOTIMG` / `BOOT_SIGN_KEY_PATH` | 后续打包/签名工具路径。 |
 | `CCACHE_DIR` | ccache 目录。 |
 
+自定义模块可通过 `$GITHUB_ENV` 写入 `ABK_EXTERNAL_MODULE_KO_LIST`，用空格分隔列出需要随内核分发的 `.ko`（例如设为 `=m` 的 USB 串口驱动）。ABK 会在编译完成后在内核构建输出中查找这些模块，并生成一个 KernelSU/Magisk 模块包 `*-Kernel-Modules.zip`。
+
 条件变量：
 
 - `KSU_VERSION`：仅 KernelSU Official 分支会设置。
@@ -217,6 +219,24 @@ grep -q '^CONFIG_EXAMPLE_FEATURE=y$' "$DEFCONFIG" || echo 'CONFIG_EXAMPLE_FEATUR
 - 限定修改范围：优先只修改 `$KERNEL_ROOT`、`$DEFCONFIG` 或模块自己的临时目录。
 - 不要假设固定内核版本：需要时读取 `${CONFIG}` 或 `${KERNEL_ROOT}/common/Makefile` 判断。
 - 不要在脚本中提交密钥、token、隐私数据或不可审计的二进制逻辑。
+
+### 自定义模块内核模块（.ko）打包
+
+ABK 的编译产物默认只包含内核 `Image`，不会收集任何 `.ko`。如果外部模块需要产出可加载的内核模块（例如把常见 USB 串口驱动设为 `=m`），可以这样接入：
+
+1. 模块在 `after_patch` 阶段把需要的 `.ko` 名称以空格分隔写入 `$GITHUB_ENV`：
+
+   ```bash
+   printf 'ABK_EXTERNAL_MODULE_KO_LIST=%s\n' "ch341.ko ftdi_sio.ko cdc-acm.ko" >> "$GITHUB_ENV"
+   ```
+
+2. 对 bazel/kleaf 构建（android14+ / 6.1+），同步更新 `$KERNEL_ROOT/common/modules.bzl`：
+   - 把设为内建（`=y`）的模块（如 `usbserial.ko`）从 GKI 模块列表移除；
+   - 把新增的 `=m` 模块加入 GKI 模块列表，否则 bazel 不会产出对应 `.ko`。
+
+3. ABK 在“准备 Boot 镜像”之后读取该变量，在 `out/` 与 `bazel-bin/` 中查找对应 `.ko`，并生成 KernelSU/Magisk 模块包 `*-Kernel-Modules.zip`（内含 `module.prop`、`system/lib/modules/*.ko` 和开机 `insmod` 的 `post-fs-data.sh`）。该包会随其它产物一起上传，打包签名后可由 App 安装。未导出该变量或未找到 `.ko` 时会自动跳过，不影响正常构建。
+
+`ABK_USB_SERIAL_DRIVERS` 模块即为该流程的参考实现。
 
 ## App
 

@@ -6539,6 +6539,109 @@ jobs:
             )
           fi
 
+      - name: 打包内核模块
+        if: inputs.custom_external_modules != ''
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -euo pipefail
+
+          # 自定义外部模块可通过 $GITHUB_ENV 导出 ABK_EXTERNAL_MODULE_KO_LIST，
+          # 列出需要收集并随内核分发的 .ko（例如 USB 串口驱动）。
+          wanted="${ABK_EXTERNAL_MODULE_KO_LIST:-}"
+          if [ -z "$wanted" ]; then
+            echo "未请求外部内核模块，跳过模块打包。"
+            exit 0
+          fi
+
+          pkg="$GITHUB_WORKSPACE/abk-kernel-modules-pkg"
+          rm -rf "$pkg"
+          mkdir -p "$pkg/system/lib/modules"
+
+          roots=()
+          for d in \
+            "$KERNEL_ROOT/out" \
+            "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64" \
+            "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64_modules" \
+            "$KERNEL_ROOT/bazel-bin/common/kernel_aarch64_dist" \
+            "$KERNEL_ROOT/bazel-bin/common"; do
+            [ -d "$d" ] && roots+=("$d")
+          done
+
+          collected=0
+          for ko in $wanted; do
+            hit=""
+            if [ "${#roots[@]}" -gt 0 ]; then
+              hit="$(find "${roots[@]}" -type f -name "$ko" 2>/dev/null | head -n1 || true)"
+            fi
+            if [ -z "$hit" ]; then
+              echo "::warning::未找到内核模块 $ko，跳过。"
+              continue
+            fi
+            cp -f "$hit" "$pkg/system/lib/modules/$ko"
+            echo "已收集 $ko <- $hit"
+            collected=$((collected + 1))
+          done
+
+          if [ "$collected" -eq 0 ]; then
+            echo "::warning::没有收集到任何内核模块，跳过模块打包。"
+            exit 0
+          fi
+
+          module_version="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}"
+
+          cat > "$pkg/module.prop" <<EOF
+          id=abk_kernel_modules
+          name=ABK Kernel Modules
+          version=$module_version
+          versionCode=1
+          author=ABK
+          description=External kernel modules (USB serial / ST-Link) built for $module_version.
+          EOF
+
+          cat > "$pkg/post-fs-data.sh" <<'KOMOD'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          # Load dependencies first, then the remaining modules.
+          for ko in "$MODDIR"/system/lib/modules/usb_wwan.ko; do
+            [ -e "$ko" ] || continue
+            insmod "$ko" 2>/dev/null
+          done
+          for ko in "$MODDIR"/system/lib/modules/*.ko; do
+            [ -e "$ko" ] || continue
+            case "$ko" in
+              */usb_wwan.ko) continue ;;
+            esac
+            insmod "$ko" 2>/dev/null
+          done
+          KOMOD
+          chmod 0755 "$pkg/post-fs-data.sh"
+
+          mkdir -p "$pkg/META-INF/com/google/android"
+          cat > "$pkg/META-INF/com/google/android/update-binary" <<'KOUPD'
+          #!/sbin/sh
+          umask 022
+          OUTFD=$2
+          ZIPFILE=$3
+          if [ -f /data/adb/magisk/util_functions.sh ]; then
+            . /data/adb/magisk/util_functions.sh
+            install_module
+          else
+            echo "KernelSU/Magisk module installer not found; install manually."
+          fi
+          exit 0
+          KOUPD
+          printf '#MAGISK\n' > "$pkg/META-INF/com/google/android/updater-script"
+
+          zip_name="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-Kernel-Modules.zip"
+          rm -f "$GITHUB_WORKSPACE/$zip_name"
+          (
+            cd "$pkg"
+            zip -r9 "$GITHUB_WORKSPACE/$zip_name" .
+          )
+          rm -rf "$pkg"
+          echo "已生成内核模块包: $zip_name"
+          ls -l "$GITHUB_WORKSPACE/$zip_name"
+
       - name: 创建 AnyKernel3 压缩包
         run: |
           cd $ANYKERNEL3

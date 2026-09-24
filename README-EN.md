@@ -179,6 +179,8 @@ Common variables available in both stages:
 | `AVBTOOL` / `MKBOOTIMG` / `UNPACK_BOOTIMG` / `BOOT_SIGN_KEY_PATH` | Tool paths used later for packaging/signing. |
 | `CCACHE_DIR` | ccache directory. |
 
+Custom modules can write `ABK_EXTERNAL_MODULE_KO_LIST` to `$GITHUB_ENV`, a space-separated list of `.ko` files that should be shipped with the kernel (for example USB serial drivers built as `=m`). ABK looks them up in the kernel build output after compilation and produces a KernelSU/Magisk module package `*-Kernel-Modules.zip`.
+
 Conditional variables:
 
 - `KSU_VERSION`: set only for the KernelSU Official branch.
@@ -218,6 +220,24 @@ Development guidance:
 - Keep edits scoped: prefer changing only `$KERNEL_ROOT`, `$DEFCONFIG`, or the module's own temporary files.
 - Do not assume a fixed kernel version. Read `${CONFIG}` or `${KERNEL_ROOT}/common/Makefile` when needed.
 - Do not include secrets, tokens, private data, or unauditable binary logic in module scripts.
+
+### Custom module `.ko` packaging
+
+ABK kernel artifacts only contain the kernel `Image` by default and do not collect any `.ko`. If a custom module needs loadable kernel modules (for example common USB serial drivers built as `=m`), wire it up like this:
+
+1. In `after_patch`, export the required `.ko` names to `$GITHUB_ENV`:
+
+   ```bash
+   printf 'ABK_EXTERNAL_MODULE_KO_LIST=%s\n' "ch341.ko ftdi_sio.ko cdc-acm.ko" >> "$GITHUB_ENV"
+   ```
+
+2. For bazel/kleaf builds (android14+ / 6.1+), update `$KERNEL_ROOT/common/modules.bzl` as well:
+   - drop modules that became built-in (`=y`, e.g. `usbserial.ko`) from the GKI module list;
+   - add the new `=m` modules to the GKI module list, otherwise bazel will not produce their `.ko`.
+
+3. After preparing boot images, ABK reads that variable, looks the `.ko` up under `out/` and `bazel-bin/`, and generates a KernelSU/Magisk module package `*-Kernel-Modules.zip` (with `module.prop`, `system/lib/modules/*.ko`, and a `post-fs-data.sh` that `insmod`s them). The package is uploaded with the other artifacts and can be installed by the app. When the variable is unset or no `.ko` is found, the step is skipped and normal builds are unaffected.
+
+The `ABK_USB_SERIAL_DRIVERS` module is the reference implementation.
 
 ## App
 
